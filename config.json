@@ -1,0 +1,11 @@
+{
+  "developer_ids": [11571013459],
+  "banned_hwids": [],
+  "banned_userids": [],
+  "features": {
+    "aimbot": true,
+    "esp": true,
+    "triggerbot": true
+  },
+  "announcement": "Welcome to Spectre"
+}
