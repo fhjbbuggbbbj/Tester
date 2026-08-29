@@ -14,5 +14,5 @@
   "developer_ids": [
     11571013459
   ],
-  "hwid_lock_enabled": false
+  "hwid_lock_enabled": true
 }
