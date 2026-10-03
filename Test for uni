@@ -1,0 +1,1771 @@
+--[[
+    NONO v10 — DEEP SCANNER EDITION
+    made by nono
+
+    NEW:
+    - Scanner reads game explorer structure depth-first
+    - Detects rig type (R6/R15/Custom/OilRig/Ragdoll) per model
+    - Detects movement system (Animate script, BodyMovers, AlignOrientation, VehicleSeat)
+    - Detects arm naming (Arm1/Arm2, LeftArm, RightArm, HumanoidArm, custom)
+    - Detects viewmodels via Camera, nil instances, LocalPlayer tools, BackpackItems
+    - Builds live part list from actual enemy characters
+    - Throttled scanner — never runs more than N ops per frame to protect low-end
+    - GC hook with per-function verification before patching
+    - Meta hook: upvalue orig set before any call can happen
+    - Aimbot: direct CFrame on smooth=1, lerp otherwise, prediction optional
+    - ESP: fully guarded, target highlighted yellow
+    - All dropdowns populated from scan
+    - Scan summary shown in UI explorer view
+]]
+
+-- ============================================================
+-- SERVICES
+-- ============================================================
+local Players    = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UIS        = game:GetService("UserInputService")
+local RStor      = game:GetService("ReplicatedStorage")
+local Http       = game:GetService("HttpService")
+local TweenSvc   = game:GetService("TweenService")
+
+local LP     = Players.LocalPlayer
+local Cam    = workspace.CurrentCamera
+local LPChar = LP.Character or LP.CharacterAdded:Wait()
+LP.CharacterAdded:Connect(function(c) LPChar = c end)
+
+-- ============================================================
+-- CAPS
+-- ============================================================
+local HAS = {
+    getgc     = type(getgc)           == "function",
+    hookfn    = type(hookfunction)    == "function",
+    dbginfo   = debug ~= nil and type(debug.getinfo) == "function",
+    hookmeta  = type(hookmetamethod)  == "function",
+    rawmeta   = type(getrawmetatable) == "function",
+    setro     = type(setreadonly)     == "function",
+    Drawing   = type(Drawing)         == "table",
+    writefile = type(writefile)       == "function",
+    readfile  = type(readfile)        == "function",
+    setclip   = type(setclipboard)    == "function",
+    getnils   = type(getnilinstances) == "function",
+    isfile    = type(isfile)          == "function",
+    getconns  = type(getconnections)  == "function",
+}
+
+-- try VIM safely
+local VIM_OK = pcall(function()
+    local v = game:GetService("VirtualInputManager")
+    v:SendMouseButtonEvent(0,0,0,false,game,0)
+end)
+HAS.vim = VIM_OK
+
+-- ============================================================
+-- STATE
+-- ============================================================
+_G.N10 = _G.N10 or {}
+local G = _G.N10
+
+G.ENABLED = true
+
+-- Default config — wallCheck OFF so aimbot works out of box
+G.CFG = G.CFG or {
+    silentAim   = false,
+    aimbot      = false,
+    tbot        = false,
+    ragebot     = false,
+    esp         = false,
+
+    fov         = 150,
+    hitPart     = "HumanoidRootPart",
+    wallCheck   = false,
+    teamCheck   = true,
+    hitChance   = 100,
+    smooth      = 1,
+    predict     = false,
+    predictStr  = 1.0,
+    aimbotMode  = "camera",
+
+    humanize    = false,
+    jitter      = 2,
+
+    trigDelay   = 0.05,
+    trigRelease = 0.05,
+    trigMode    = "vim",
+    trigKey     = false,
+    trigKeyCode = Enum.KeyCode.E,
+
+    rageInt     = 0.08,
+    multiShot   = 1,
+
+    espDist     = 1200,
+    shootRemote = "auto",
+
+    mobEnabled  = true,
+    mobSize     = 110,
+    mobX        = 0,
+    mobY        = 0,
+    mobText     = "FIRE",
+    mobR        = 220, mobG = 40, mobB = 40,
+    mobAlpha    = 0,
+}
+
+-- Scan results
+G.SCAN = {
+    -- world
+    class       = "UNKNOWN",
+    rigReport   = {},    -- per-model rig info
+    moveSystem  = "Unknown",
+    physics     = {},
+
+    -- character parts (dynamic from live scan)
+    parts       = {
+        "HumanoidRootPart","Head",
+        "UpperTorso","LowerTorso","Torso",
+        "LeftUpperArm","RightUpperArm",
+        "LeftLowerArm","RightLowerArm",
+        "LeftHand","RightHand",
+        "LeftUpperLeg","RightUpperLeg",
+        "LeftLowerLeg","RightLowerLeg",
+        "LeftFoot","RightFoot",
+    },
+
+    -- remotes
+    remotes     = {},
+    shootList   = {"auto"},
+    activeShoot = nil,
+
+    -- viewmodels
+    vmList      = {"none"},
+    vmObjects   = {},
+    activeVM    = nil,
+
+    -- explorer snapshot (shown in UI)
+    explorerLines = {},
+
+    -- anti-cheat
+    antiCheat   = {},
+
+    -- aim method
+    aimType     = "camera",
+    aimConf     = 0,
+
+    -- arm names found
+    armNames    = {},
+}
+
+G.HOOKS  = { gc={}, meta=nil, installed=false, gcDone=false }
+G.STATS  = { fps=60, ping=0, active=0 }
+G.REPORT = {}
+G.SCAN_STAGE  = 0
+G.SCAN_TOTAL  = 10
+G.GC_STAGE    = 0
+G.GC_TOTAL    = 1
+
+local CONNS  = {}
+local DRAWS  = {}
+local fpsBuf = {}
+
+local function log(s)  G.REPORT[#G.REPORT+1] = tostring(s) end
+local function safe(f) local ok,v=pcall(f); return ok and v or nil end
+local function run(f)  pcall(f) end
+
+-- bypass scope
+local _byp = setmetatable({},{__mode="k"})
+local function curT()    return coroutine.running() or "M" end
+local function byp(v)    _byp[curT()] = v end
+local function inByp()   return _byp[curT()] == true end
+
+-- presets
+local PRESETS = {
+    Rage   = {silentAim=true,aimbot=true,tbot=true, ragebot=true, fov=300,smooth=1, wallCheck=false,hitPart="HumanoidRootPart",rageInt=0.05,multiShot=2},
+    Legit  = {silentAim=true,aimbot=true,tbot=false,ragebot=false,fov=100,smooth=8, wallCheck=false,hitPart="Head"},
+    Stealth= {silentAim=true,aimbot=true,tbot=false,ragebot=false,fov=70, smooth=15,wallCheck=false,hitPart="Head"},
+}
+
+-- ============================================================
+-- THROTTLED ITERATOR
+-- Yields every `budget` ops so frame time stays safe on low-end
+-- ============================================================
+local BUDGET = 300   -- ops per yield — safe for ~30fps low-end
+
+local function throttledWalk(list, budget, cb)
+    local n = 0
+    for i, item in ipairs(list) do
+        cb(i, item)
+        n += 1
+        if n >= budget then
+            n = 0
+            task.wait()
+        end
+    end
+end
+
+-- ============================================================
+-- SECTION 1 — DEEP SCANNER
+-- ============================================================
+
+-- 1-A  Collect all descendants of a root up to maxDepth
+--      Returns flat array — evaluated lazily in chunks
+local function collectDesc(root, maxDepth)
+    local result = {}
+    local stack  = {{obj=root, depth=0}}
+    local i      = 1
+    while i <= #stack do
+        local entry = stack[i]; i += 1
+        local obj   = entry.obj
+        local depth = entry.depth
+        if depth > maxDepth then continue end
+        local ok, kids = pcall(function() return obj:GetChildren() end)
+        if ok then
+            for _, k in ipairs(kids) do
+                result[#result+1] = {obj=k, depth=depth+1, parent=obj}
+                stack[#stack+1]   = {obj=k, depth=depth+1}
+            end
+        end
+    end
+    return result
+end
+
+-- 1-B  Classify world rig type
+local function doClassify()
+    local oil, def, cust = 0,0,0
+    local ok, kids = pcall(function() return workspace:GetChildren() end)
+    if not ok then return end
+    local checked = 0
+    for _, m in ipairs(kids) do
+        if checked > 150 then break end
+        local cn = safe(function() return m.ClassName end) or ""
+        if cn ~= "Model" then continue end
+        checked += 1
+        local nm = safe(function() return m.Name end) or ""
+        if nm:find("Rig") or nm:find("Oil") then oil+=2 end
+        local m6,hum,head = 0,false,false
+        local ok2,c2 = pcall(function() return m:GetDescendants() end)
+        if ok2 then
+            for _,d in ipairs(c2) do
+                local dcn = safe(function() return d.ClassName end) or ""
+                if dcn=="Motor6D"  then m6+=1 end
+                if dcn=="Humanoid" then hum=true end
+                if dcn=="Part" and (safe(function() return d.Name end) or "")=="Head" then head=true end
+            end
+        end
+        if m6>8  then oil+=2 end
+        if m6>=6 and m6<=16 and hum and head then def+=2 end
+        if safe(function() return m:FindFirstChild("Animate") ~= nil end) then def+=1 end
+        if hum and not head then cust+=1 end
+    end
+    G.SCAN.class = (oil>def+cust and oil>=4) and "OILRIG"
+        or (def>=3) and "DEFAULT_RIG"
+        or (cust>=2) and "CUSTOM_RIG"
+        or "UNKNOWN"
+    log("[Class] "..G.SCAN.class)
+end
+
+-- 1-C  Per-enemy rig deep analysis
+--      Detects: R6/R15/Custom, arm naming, bone structure, movement scripts
+local ARM_PATTERNS = {
+    {"LeftArm","RightArm"},           -- R6 classic
+    {"Left Arm","Right Arm"},          -- R6 spaced
+    {"LeftUpperArm","RightUpperArm"},  -- R15
+    {"Arm1","Arm2"},                   -- custom indexed
+    {"ArmL","ArmR"},                   -- short custom
+    {"HumanoidArm_L","HumanoidArm_R"}, -- some FPS rigs
+    {"WeaponArm","ShieldArm"},         -- combat rigs
+    {"Limb_L","Limb_R"},
+    {"BoneArm_L","BoneArm_R"},
+}
+
+local MOVE_INDICATORS = {
+    AlignOrientation = "AlignOrientation (physics mover)",
+    BodyVelocity     = "BodyVelocity (legacy mover)",
+    BodyGyro         = "BodyGyro (legacy gyro)",
+    VehicleSeat      = "VehicleSeat (vehicle)",
+    LinearVelocity   = "LinearVelocity (constraint mover)",
+    AngularVelocity  = "AngularVelocity (constraint gyro)",
+    Animator         = "Animator (animation mover)",
+}
+
+local function analyzeChar(char, label)
+    local info = {
+        label       = label,
+        parts       = {},
+        motors      = {},
+        bones       = {},
+        scripts     = {},
+        rigType     = "Unknown",
+        armStyle    = "Unknown",
+        moveStyle   = "Unknown",
+        humanoid    = nil,
+    }
+
+    local desc = safe(function() return char:GetDescendants() end) or {}
+
+    local partSet  = {}
+    local motorSet = {}
+    local boneSet  = {}
+    local m6count  = 0
+    local hasBones = false
+    local moveFound= {}
+
+    for _, d in ipairs(desc) do
+        local cn = safe(function() return d.ClassName end) or ""
+        local nm = safe(function() return d.Name end) or ""
+
+        -- parts
+        if cn=="Part" or cn=="MeshPart" or cn=="UnionOperation" then
+            if nm~="" and not partSet[nm] then
+                partSet[nm]=true
+                info.parts[#info.parts+1] = nm
+            end
+        end
+
+        -- motor6d
+        if cn=="Motor6D" then
+            m6count+=1
+            local p0 = safe(function() return d.Part0 and d.Part0.Name end) or "?"
+            local p1 = safe(function() return d.Part1 and d.Part1.Name end) or "?"
+            if not motorSet[p1] then
+                motorSet[p1]=true
+                info.motors[#info.motors+1] = p0.." → "..p1
+            end
+        end
+
+        -- bones
+        if cn=="Bone" then
+            hasBones=true
+            if nm~="" and not boneSet[nm] then
+                boneSet[nm]=true
+                info.bones[#info.bones+1] = nm
+            end
+        end
+
+        -- scripts (Animate, movement controllers)
+        if cn=="LocalScript" or cn=="Script" or cn=="ModuleScript" then
+            info.scripts[#info.scripts+1] = nm.." ("..cn..")"
+        end
+
+        -- humanoid
+        if cn=="Humanoid" then
+            info.humanoid = {
+                Health    = safe(function() return d.Health end),
+                MaxHealth = safe(function() return d.MaxHealth end),
+                WalkSpeed = safe(function() return d.WalkSpeed end),
+                JumpPower = safe(function() return d.JumpPower end),
+                RigType   = safe(function() return tostring(d.RigType) end),
+                AutoRotate= safe(function() return d.AutoRotate end),
+            }
+            if info.humanoid.RigType then
+                if info.humanoid.RigType:find("R6")  then info.rigType="R6"
+                elseif info.humanoid.RigType:find("R15") then info.rigType="R15" end
+            end
+        end
+
+        -- movement indicators
+        for indicator, label2 in pairs(MOVE_INDICATORS) do
+            if cn==indicator then
+                if not moveFound[indicator] then
+                    moveFound[indicator]=true
+                    info.moveStyle = label2
+                end
+            end
+        end
+    end
+
+    -- refine rig type from motor count
+    if info.rigType=="Unknown" then
+        if m6count==6  then info.rigType="R6"
+        elseif m6count>=15 and m6count<=17 then info.rigType="R15"
+        elseif m6count>17 then info.rigType="Custom/OilRig("..m6count.."M6D)"
+        elseif hasBones then info.rigType="Bone-Based"
+        end
+    end
+
+    -- detect arm naming style
+    for _, pairNames in ipairs(ARM_PATTERNS) do
+        local l,r = pairNames[1],pairNames[2]
+        if partSet[l] or partSet[r] then
+            info.armStyle = l.." / "..r
+            break
+        end
+    end
+
+    -- if moveStyle still unknown, check for Animate script
+    if info.moveStyle=="Unknown" then
+        for _, sn in ipairs(info.scripts) do
+            if sn:lower():find("animate") then
+                info.moveStyle="Animate Script (roblox standard)"; break
+            end
+        end
+    end
+
+    return info
+end
+
+local function doScanRigs()
+    G.SCAN.rigReport = {}
+    local explorerLines = {}
+    local partsSeen = {}
+    for _,p in ipairs(G.SCAN.parts) do partsSeen[p]=true end
+
+    -- scan live enemy characters
+    for _, pl in ipairs(Players:GetPlayers()) do
+        if pl==LP then continue end
+        local char = safe(function() return pl.Character end)
+        if not char then continue end
+        local info = analyzeChar(char, pl.Name)
+        G.SCAN.rigReport[#G.SCAN.rigReport+1] = info
+
+        -- add parts to global list
+        for _,p in ipairs(info.parts) do
+            if not partsSeen[p] then
+                partsSeen[p]=true
+                G.SCAN.parts[#G.SCAN.parts+1]=p
+            end
+        end
+
+        -- add arm names
+        if info.armStyle~="Unknown" then
+            G.SCAN.armNames[#G.SCAN.armNames+1] = pl.Name..": "..info.armStyle
+        end
+
+        -- explorer lines
+        explorerLines[#explorerLines+1] = "── "..pl.Name.." ["..info.rigType.."]"
+        explorerLines[#explorerLines+1] = "   Arms: "..info.armStyle
+        explorerLines[#explorerLines+1] = "   Move: "..info.moveStyle
+        explorerLines[#explorerLines+1] = "   Parts("..#info.parts.."): "..table.concat(info.parts,", ")
+        if #info.motors>0 then
+            explorerLines[#explorerLines+1]="   Motors: "..table.concat(info.motors," | ")
+        end
+        if #info.bones>0 then
+            explorerLines[#explorerLines+1]="   Bones: "..table.concat(info.bones,", ")
+        end
+
+        log(("[Rig] %s → %s | Arms: %s | Move: %s | Parts: %d | Motors: %d | Bones: %d"):format(
+            pl.Name, info.rigType, info.armStyle, info.moveStyle,
+            #info.parts, #info.motors, #info.bones))
+
+        task.wait()  -- yield between players — low-end safe
+    end
+
+    -- also scan workspace models with humanoids
+    local ok, kids = pcall(function() return workspace:GetChildren() end)
+    if ok then
+        local n=0
+        for _, m in ipairs(kids) do
+            if n>60 then break end
+            local cn = safe(function() return m.ClassName end) or ""
+            if cn~="Model" then continue end
+            if not safe(function() return m:FindFirstChildWhichIsA("Humanoid") ~= nil end) then continue end
+            -- skip if it's a player char we already did
+            local isPl = false
+            for _,pl in ipairs(Players:GetPlayers()) do
+                if safe(function() return pl.Character==m end) then isPl=true; break end
+            end
+            if isPl then continue end
+
+            n+=1
+            local info = analyzeChar(m, m.Name)
+            G.SCAN.rigReport[#G.SCAN.rigReport+1] = info
+            for _,p in ipairs(info.parts) do
+                if not partsSeen[p] then
+                    partsSeen[p]=true
+                    G.SCAN.parts[#G.SCAN.parts+1]=p
+                end
+            end
+            explorerLines[#explorerLines+1]="── WS:"..m.Name.." ["..info.rigType.."]"
+            explorerLines[#explorerLines+1]="   Arms: "..info.armStyle
+            explorerLines[#explorerLines+1]="   Move: "..info.moveStyle
+            if n%5==0 then task.wait() end
+        end
+    end
+
+    G.SCAN.explorerLines = explorerLines
+    log(("[Rigs] %d analysed | %d parts total"):format(#G.SCAN.rigReport, #G.SCAN.parts))
+end
+
+-- 1-D  Detect movement system from LP perspective
+local function doMoveSystem()
+    local systems = {}
+    if LPChar then
+        local desc = safe(function() return LPChar:GetDescendants() end) or {}
+        for _,d in ipairs(desc) do
+            local cn = safe(function() return d.ClassName end) or ""
+            for indicator, label in pairs(MOVE_INDICATORS) do
+                if cn==indicator then systems[#systems+1]=label end
+            end
+            if cn=="LocalScript" then
+                local nm = (safe(function() return d.Name end) or ""):lower()
+                if nm:find("control") or nm:find("move") or nm:find("animate") then
+                    systems[#systems+1]="Script:"..nm
+                end
+            end
+        end
+    end
+    -- check ControlModule
+    local ps = safe(function() return LP:FindFirstChild("PlayerScripts") end)
+    if ps then
+        local cm = safe(function() return ps:FindFirstChild("PlayerModule") end)
+        if cm then systems[#systems+1]="PlayerModule (standard ControlModule)" end
+    end
+    G.SCAN.moveSystem = #systems>0 and table.concat(systems," | ") or "Unknown"
+    log("[MoveSystem] "..G.SCAN.moveSystem)
+end
+
+-- 1-E  Viewmodel deep scan
+local function doScanViewmodels()
+    G.SCAN.vmList    = {"none"}
+    G.SCAN.vmObjects = {}
+    G.SCAN.activeVM  = nil
+
+    local function tryAdd(obj, label)
+        if not obj then return end
+        local path = safe(function() return obj:GetFullName() end) or label
+        if G.SCAN.vmObjects[path] then return end  -- dedup
+        G.SCAN.vmList[#G.SCAN.vmList+1] = path
+        G.SCAN.vmObjects[path] = obj
+        if not G.SCAN.activeVM then G.SCAN.activeVM = obj end
+        log("[VM] "..path)
+
+        -- log what's inside the viewmodel
+        local desc = safe(function() return obj:GetDescendants() end) or {}
+        local partNames,scriptNames = {},{}
+        for _,d in ipairs(desc) do
+            local cn = safe(function() return d.ClassName end) or ""
+            local nm = safe(function() return d.Name end) or ""
+            if cn=="Part" or cn=="MeshPart" then partNames[#partNames+1]=nm end
+            if cn=="LocalScript" or cn=="Script" then scriptNames[#scriptNames+1]=nm end
+        end
+        if #partNames>0  then log("  VM parts: "..table.concat(partNames,", ")) end
+        if #scriptNames>0 then log("  VM scripts: "..table.concat(scriptNames,", ")) end
+    end
+
+    -- camera children
+    local camKids = safe(function() return Cam:GetChildren() end) or {}
+    for _,c in ipairs(camKids) do
+        local nm = (safe(function() return c.Name end) or ""):lower()
+        local cn = safe(function() return c.ClassName end) or ""
+        if cn=="Model" or cn=="Tool" or
+           nm:find("view") or nm:find("arm") or nm:find("weapon") or nm:find("gun") then
+            tryAdd(c, "Cam."..nm)
+        end
+    end
+
+    -- LP Backpack
+    local bp = safe(function() return LP:FindFirstChild("Backpack") end)
+    if bp then
+        local bKids = safe(function() return bp:GetChildren() end) or {}
+        for _,t in ipairs(bKids) do
+            if safe(function() return t.ClassName end)=="Tool" then tryAdd(t,"Backpack."..( safe(function() return t.Name end) or "?")) end
+        end
+    end
+
+    -- equipped tool in character
+    if LPChar then
+        local charDesc = safe(function() return LPChar:GetChildren() end) or {}
+        for _,c in ipairs(charDesc) do
+            if safe(function() return c.ClassName end)=="Tool" then tryAdd(c,"Char."..( safe(function() return c.Name end) or "?")) end
+        end
+    end
+
+    -- nil instances (some games store viewmodel here)
+    if HAS.getnils then
+        local ok2,nils = pcall(getnilinstances)
+        if ok2 and type(nils)=="table" then
+            for _,obj in ipairs(nils) do
+                local cn = safe(function() return obj.ClassName end) or ""
+                if cn=="Tool" or cn=="Model" then
+                    local nm = (safe(function() return obj.Name end) or ""):lower()
+                    if nm:find("weapon") or nm:find("gun") or nm:find("arm") or
+                       nm:find("view") or nm:find("rifle") or nm:find("pistol") then
+                        tryAdd(obj,"nil."..nm)
+                    end
+                end
+            end
+        end
+    end
+
+    log(("[VM] %d found"):format(#G.SCAN.vmList-1))
+end
+
+-- 1-F  Remote scan
+local SHOOT_K  = {"shoot","fire","bullet","ray","attack","hitscan","cast","proj","hit","damage","gun","weapon"}
+local DAMAGE_K = {"damage","hurt","kill","death","hp","health","takedmg","dealDmg"}
+local AC_K     = {"anticheat","anti_cheat","_ac_","guard","sentry","byfron","hyperion","battleye","sanity","verify","report","validate"}
+local SKIP_K   = {"package","packagelink","assetservice","gamepass","marketplaceservice"}
+
+local function remPurpose(nm)
+    local low = nm:lower()
+    for _,k in ipairs(AC_K)     do if low:find(k,1,true) then return "ac"    end end
+    for _,k in ipairs(SHOOT_K)  do if low:find(k,1,true) then return "shoot" end end
+    for _,k in ipairs(DAMAGE_K) do if low:find(k,1,true) then return "dmg"   end end
+    return "other"
+end
+
+local function doScanRemotes()
+    G.SCAN.remotes    = {}
+    G.SCAN.shootList  = {"auto"}
+    G.SCAN.activeShoot= nil
+    G.SCAN.antiCheat  = {}
+    local seen        = {}
+
+    local function scanIn(root, tag)
+        if not root then return end
+        local desc = safe(function() return root:GetDescendants() end) or {}
+        -- throttled
+        local n=0
+        for _,d in ipairs(desc) do
+            n+=1
+            if n%BUDGET==0 then task.wait() end
+            local cn = safe(function() return d.ClassName end) or ""
+            if cn~="RemoteEvent" and cn~="RemoteFunction" then continue end
+            local nm = safe(function() return d.Name end) or ""
+            if nm=="" then continue end
+
+            -- skip junk
+            local low = nm:lower()
+            local skip=false
+            for _,k in ipairs(SKIP_K) do if low:find(k,1,true) then skip=true; break end end
+            if skip then continue end
+            if seen[nm] then continue end
+            seen[nm]=true
+
+            local p = remPurpose(nm)
+            local listeners = nil
+            if HAS.getconns then
+                local ok2,conns = pcall(getconnections, d.OnClientEvent)
+                if ok2 then listeners=#conns end
+            end
+
+            G.SCAN.remotes[#G.SCAN.remotes+1] = {
+                name=nm, obj=d, purpose=p, tag=tag, listeners=listeners, cn=cn
+            }
+
+            if p=="ac" then
+                G.SCAN.antiCheat[#G.SCAN.antiCheat+1] = tag..":"..nm
+            elseif p=="shoot" or p=="dmg" then
+                G.SCAN.shootList[#G.SCAN.shootList+1] = nm
+                if not G.SCAN.activeShoot then G.SCAN.activeShoot=d end
+                log(("[Remote] ✓ SHOOT: %s (%s) lc=%s"):format(nm,tag,tostring(listeners)))
+            else
+                log(("[Remote] %s [%s] (%s)"):format(nm,p,tag))
+            end
+        end
+    end
+
+    scanIn(RStor, "RS")
+    pcall(function() scanIn(LP:FindFirstChild("PlayerScripts"), "PS") end)
+    pcall(function() scanIn(LP:FindFirstChild("PlayerGui"),     "PG") end)
+    scanIn(workspace, "WS")
+
+    -- dedup antiCheat list
+    local seen2,clean={},{}
+    for _,v in ipairs(G.SCAN.antiCheat) do if not seen2[v] then seen2[v]=true; clean[#clean+1]=v end end
+    G.SCAN.antiCheat=clean
+
+    log(("[Remotes] total=%d shoot=%d ac=%d"):format(#G.SCAN.remotes,#G.SCAN.shootList-1,#G.SCAN.antiCheat))
+end
+
+-- 1-G  Physics
+local function doPhysics()
+    local hum  = LPChar and safe(function() return LPChar:FindFirstChildWhichIsA("Humanoid") end)
+    G.SCAN.physics = {
+        gravity   = safe(function() return workspace.Gravity end) or 196.2,
+        walkSpeed = hum and safe(function() return hum.WalkSpeed end) or 16,
+        jumpPower = hum and safe(function() return hum.JumpPower end) or 50,
+        streaming = safe(function() return workspace.StreamingEnabled end) or false,
+        fallHeight= safe(function() return workspace.FallenPartsDestroyHeight end) or -500,
+    }
+    log(("[Physics] G=%.1f WS=%.1f JP=%.1f Stream=%s"):format(
+        G.SCAN.physics.gravity, G.SCAN.physics.walkSpeed,
+        G.SCAN.physics.jumpPower, tostring(G.SCAN.physics.streaming)))
+end
+
+-- 1-H  Aim method
+local function doAimMethod()
+    local score = 0
+    local mb = safe(function() return UIS.MouseBehavior end)
+    if mb==Enum.MouseBehavior.LockCenter          then score+=60 end
+    if mb==Enum.MouseBehavior.LockCurrentPosition then score+=25 end
+    local subj = safe(function() return Cam.CameraSubject end)
+    if subj and safe(function() return subj:IsA("Humanoid") end) then score+=8 end
+    if G.SCAN.activeVM then
+        local h = safe(function() return G.SCAN.activeVM:FindFirstChild("Handle") end)
+        if h then score+=20; G.SCAN.aimType="viewmodel" end
+    end
+    if G.SCAN.activeShoot   then score+=10 end
+    if safe(function() return Cam.CameraType end)==Enum.CameraType.Scriptable then score+=15 end
+    G.SCAN.aimConf      = math.min(100,score)
+    G.CFG.aimbotMode    = G.SCAN.aimType
+    log(("[AimMethod] %s conf=%d%%"):format(G.SCAN.aimType,G.SCAN.aimConf))
+end
+
+-- ============================================================
+-- SCAN RUNNER — stages run one per frame yield
+-- ============================================================
+local scanCBs = {}
+local function runScanner(cb)
+    if cb then scanCBs[#scanCBs+1]=cb end
+    task.spawn(function()
+        log("=== SCAN START v10 ===")
+        G.SCAN_STAGE = 0
+        local stages = {
+            {"Classify",     doClassify},
+            {"Rig analysis", doScanRigs},
+            {"Move system",  doMoveSystem},
+            {"Viewmodels",   doScanViewmodels},
+            {"Remotes",      doScanRemotes},
+            {"Physics",      doPhysics},
+            {"Aim method",   doAimMethod},
+        }
+        G.SCAN_TOTAL = #stages
+        for i,s in ipairs(stages) do
+            log(("[Stage %d] %s"):format(i,s[1]))
+            pcall(s[2])
+            G.SCAN_STAGE=i
+            task.wait()
+        end
+        log("=== SCAN DONE ===")
+        for _,fn in ipairs(scanCBs) do pcall(fn) end
+        scanCBs={}
+    end)
+end
+
+-- ============================================================
+-- SECTION 2 — TARGET SYSTEM
+-- ============================================================
+local tcache = {t=nil, ts=0, TTL=0.033}
+
+local function getShootRemote()
+    if G.CFG.shootRemote=="auto" then return G.SCAN.activeShoot end
+    for _,r in ipairs(G.SCAN.remotes) do
+        if r.name==G.CFG.shootRemote then return r.obj end
+    end
+    return G.SCAN.activeShoot
+end
+
+local function findTarget()
+    byp(true)
+    local best, bestD = nil, G.CFG.fov
+    local camCF = safe(function() return Cam.CFrame end)
+    if not camCF then byp(false); return nil end
+    local vp    = Cam.ViewportSize
+    local cx,cy = vp.X/2, vp.Y/2
+
+    for _,pl in ipairs(Players:GetPlayers()) do
+        if pl==LP then continue end
+        if G.CFG.teamCheck and safe(function() return pl.Team==LP.Team end) then continue end
+
+        local char = safe(function() return pl.Character end)
+        if not char then continue end
+
+        local hum = safe(function() return char:FindFirstChildWhichIsA("Humanoid") end)
+        if not hum or (safe(function() return hum.Health end) or 0)<=0 then continue end
+
+        -- part fallback chain
+        local part = safe(function() return char:FindFirstChild(G.CFG.hitPart) end)
+                  or safe(function() return char:FindFirstChild("HumanoidRootPart") end)
+                  or safe(function() return char:FindFirstChild("Head") end)
+                  or safe(function() return char:FindFirstChild("UpperTorso") end)
+                  or safe(function() return char:FindFirstChild("Torso") end)
+                  or safe(function() return char:FindFirstChildWhichIsA("BasePart") end)
+        if not part then continue end
+
+        local pos = safe(function() return part.Position end)
+        if not pos then continue end
+
+        local sp, vis = Cam:WorldToViewportPoint(pos)
+        if not vis then continue end
+
+        if G.CFG.wallCheck then
+            local o   = camCF.Position
+            local dir = pos-o
+            local ray = Ray.new(o, dir.Unit*math.min(dir.Magnitude,9999))
+            local hit = safe(function() return workspace:FindPartOnRayWithIgnoreList(ray,{LPChar,Cam}) end)
+            if hit and not safe(function() return hit:IsDescendantOf(char) end) then continue end
+        end
+
+        local d = Vector2.new(sp.X-cx, sp.Y-cy).Magnitude
+        if d<bestD then bestD=d; best={pl=pl,char=char,part=part,pos=pos} end
+    end
+
+    byp(false)
+    return best
+end
+
+local function refreshCache()
+    if not (G.CFG.silentAim or G.CFG.aimbot or G.CFG.tbot or G.CFG.ragebot) then
+        tcache.t=nil; return
+    end
+    local now=tick()
+    if now-tcache.ts < tcache.TTL then return end
+    tcache.t  = findTarget()
+    tcache.ts = now
+end
+
+-- ============================================================
+-- SECTION 3 — GC HOOK
+-- ============================================================
+local GC_NAMES = {
+    "BulletRayCast","BulletRaycast","RayCastBullet","RaycastBullet",
+    "CastBullet","FireBullet","CreateBullet","SpawnBullet","HandleBullet",
+    "Hitscan","HitScan","RayCastShoot","FireRay","ShootBullet",
+    "ClientShoot","ProcessHit","ShootRay","CalculateBullet",
+}
+
+local function patchBulletArgs(args, tpos, n)
+    if typeof(args[1])=="CFrame" then
+        args[1]=CFrame.lookAt(args[1].Position,tpos); return true end
+    if typeof(args[1])=="Vector3" and n>=2 then
+        if typeof(args[2])=="Vector3" then args[2]=(tpos-args[1]).Unit; return true end
+        if typeof(args[2])=="CFrame"  then args[2]=CFrame.lookAt(args[1],tpos); return true end
+    end
+    if type(args[1])=="table" then
+        local t=args[1]
+        local o=t.origin or t.Origin or t.position or t.startPos or t.Start or t.from or t.From
+        if o and typeof(o)=="Vector3" then
+            local d=(tpos-o).Unit
+            if t.direction then t.direction=d end
+            if t.dir       then t.dir=d       end
+            if t.Direction then t.Direction=d end
+            return true
+        end
+        local k1,k2
+        for k,v in pairs(t) do
+            if typeof(v)=="Vector3" then
+                if not k1 then k1=k elseif not k2 then k2=k; break end
+            end
+        end
+        if k1 and k2 then t[k2]=(tpos-t[k1]).Unit; return true end
+    end
+    for i=1,n-1 do
+        if typeof(args[i])=="Vector3" and typeof(args[i+1])=="Vector3" then
+            args[i+1]=(tpos-args[i]).Unit; return true
+        end
+    end
+    return false
+end
+
+local function installGCHook()
+    if not (HAS.getgc and HAS.hookfn and HAS.dbginfo) then log("[GC] caps missing"); return end
+    if G.HOOKS.gcDone then return end
+
+    log("[GC] starting…")
+    local ok,gc = pcall(getgc,true)
+    if not ok or type(gc)~="table" then log("[GC] getgc failed"); return end
+    G.GC_TOTAL = math.max(1,math.ceil(#gc/500))
+    log(("[GC] %d objects in GC"):format(#gc))
+
+    local checked,hooked = 0,0
+    for i=1,#gc do
+        checked+=1
+        if checked%500==0 then G.GC_STAGE=math.floor(checked/500); task.wait() end
+        if hooked>=24 then break end
+
+        local v = gc[i]
+        if type(v)~="function" then continue end
+
+        local ok2,info = pcall(debug.getinfo,v,"n")
+        if not ok2 or type(info)~="table" or not info.name then continue end
+
+        local matched=false
+        for _,pat in ipairs(GC_NAMES) do
+            if info.name==pat or info.name:find(pat,1,true) then matched=true; break end
+        end
+        if not matched then continue end
+
+        -- verify function is actually callable and not already hooked
+        local orig_ref = {v=nil}
+        local function wrapper(...)
+            local orig = orig_ref.v
+            if not orig then return end
+            if inByp() or not G.CFG.silentAim then return orig(...) end
+            local t = tcache.t
+            if not t then return orig(...) end
+            local n = select("#",...)
+            if n==0 then return orig(...) end
+            local args = table.pack(...)
+            local tpos = t.pos or t.part.Position
+            if patchBulletArgs(args,tpos,n) then
+                byp(true)
+                local r = table.pack(orig(table.unpack(args,1,n)))
+                byp(false)
+                return table.unpack(r,1,r.n)
+            end
+            return orig(...)
+        end
+
+        local okH,orig = pcall(hookfunction,v,wrapper)
+        if okH and orig then
+            orig_ref.v = orig
+            G.HOOKS.gc[#G.HOOKS.gc+1]={fn=v,orig=orig,wrap=wrapper,name=info.name}
+            hooked+=1
+            log("[GC-Hook] "..info.name)
+        end
+    end
+
+    G.HOOKS.gcDone = hooked>0
+    G.GC_STAGE     = G.GC_TOTAL
+    log(("[GC] done — %d hooked"):format(hooked))
+end
+
+local function uninstallGC()
+    for _,h in ipairs(G.HOOKS.gc) do
+        pcall(function() hookfunction(h.fn,h.orig) end)
+    end
+    G.HOOKS.gc={}; G.HOOKS.gcDone=false
+end
+
+-- ============================================================
+-- SECTION 4 — META HOOK
+-- ============================================================
+local function installMetaHook()
+    if G.HOOKS.meta then return end
+
+    local RAY_METHODS = {
+        Raycast=1,FindPartOnRay=1,
+        FindPartOnRayWithIgnoreList=1,FindPartOnRayWithWhitelist=1,
+    }
+
+    -- upvalue — set AFTER hookmetamethod returns, checked at top of wrapper
+    local orig
+
+    local function wrapper(self,...)
+        if not orig then return end                        -- hook not ready yet
+        if inByp() or not G.ENABLED then return orig(self,...) end
+
+        local method
+        pcall(function() method=getnamecallmethod() end)
+        if not method then return orig(self,...) end
+
+        -- raycast intercept
+        if RAY_METHODS[method] and G.CFG.silentAim then
+            if math.random(1,100)>G.CFG.hitChance then return orig(self,...) end
+            local t=tcache.t
+            if not t then return orig(self,...) end
+            local tpos=t.pos or t.part.Position
+            local n=select("#",...)
+            local patched,res=false,nil
+
+            byp(true)
+            pcall(function()
+                if method=="Raycast" and n>=2 then
+                    local o=select(1,...)
+                    if typeof(o)=="Vector3" then
+                        local d=(tpos-o).Unit*1000
+                        res = n>=3 and orig(self,o,d,select(3,...)) or orig(self,o,d)
+                        patched=true
+                    end
+                elseif n>=1 then
+                    local ray=select(1,...)
+                    if typeof(ray)=="Ray" then
+                        local nr=Ray.new(ray.Origin,(tpos-ray.Origin).Unit*1000)
+                        local args={nr}
+                        for i=2,n do args[i]=select(i,...) end
+                        res=orig(self,table.unpack(args)); patched=true
+                    end
+                end
+            end)
+            byp(false)
+            if patched then return res end
+            return orig(self,...)
+        end
+
+        -- FireServer intercept on shoot remote
+        if method=="FireServer" and G.CFG.silentAim then
+            local sr=getShootRemote()
+            if sr and self==sr then
+                local t=tcache.t
+                if t then
+                    local n=select("#",...)
+                    if n>0 then
+                        local args=table.pack(...)
+                        local tpos=t.pos or t.part.Position
+                        if patchBulletArgs(args,tpos,n) then
+                            byp(true)
+                            local r=table.pack(orig(self,table.unpack(args,1,n)))
+                            byp(false)
+                            return table.unpack(r,1,r.n)
+                        end
+                    end
+                end
+            end
+        end
+
+        return orig(self,...)
+    end
+
+    local done=false
+    if HAS.hookmeta then
+        local ok,o=pcall(hookmetamethod,game,"__namecall",wrapper)
+        if ok and o then orig=o; G.HOOKS.meta={orig=o,via="hookmetamethod"}; done=true end
+    end
+    if not done and HAS.rawmeta and HAS.setro then
+        pcall(function()
+            local mt=getrawmetatable(game)
+            local o=mt.__namecall
+            orig=o
+            setreadonly(mt,false)
+            mt.__namecall=function(s,...) return wrapper(s,...) end
+            setreadonly(mt,true)
+            G.HOOKS.meta={orig=o,via="rawmeta"}; done=true
+        end)
+    end
+
+    if done then log("[Meta] installed via "..G.HOOKS.meta.via)
+    else         log("[Meta] FAILED — no hook method") end
+end
+
+local function installHooks()
+    if G.HOOKS.installed then return end
+    G.HOOKS.installed=true
+    task.spawn(function()
+        pcall(installGCHook)
+        pcall(installMetaHook)
+    end)
+end
+
+local function forceReinstall()
+    uninstallGC()
+    G.HOOKS.meta=nil; G.HOOKS.installed=false
+    installHooks()
+end
+
+-- ============================================================
+-- SECTION 5 — AIMBOT
+-- ============================================================
+local function startAimbot()
+    CONNS[#CONNS+1]=RunService.RenderStepped:Connect(function()
+        if not G.CFG.aimbot then return end
+        local t=tcache.t
+        if not t then return end
+        local tpos=safe(function() return t.pos or t.part.Position end)
+        if not tpos then return end
+
+        if G.CFG.predict then
+            local hrp=safe(function() return t.char:FindFirstChild("HumanoidRootPart") end)
+            if hrp then
+                local vel =safe(function() return hrp.Velocity end) or Vector3.new()
+                local ping=safe(function() return LP:GetNetworkPing() end) or 0.08
+                tpos = tpos + vel*(ping+0.05)*G.CFG.predictStr
+            end
+        end
+
+        pcall(function()
+            local cp  = Cam.CFrame.Position
+            local goal= CFrame.new(cp,tpos)
+            local sm  = math.max(1,G.CFG.smooth)
+
+            -- direct snap on smooth=1, lerp otherwise
+            Cam.CFrame = sm<=1 and goal or Cam.CFrame:Lerp(goal,1/sm)
+
+            if G.CFG.aimbotMode=="humanoid_targetpoint" then
+                local hum=LPChar and safe(function() return LPChar:FindFirstChildWhichIsA("Humanoid") end)
+                if hum then run(function() hum.TargetPoint=tpos end) end
+            end
+            if G.CFG.aimbotMode=="viewmodel" and G.SCAN.activeVM then
+                local h=safe(function() return G.SCAN.activeVM:FindFirstChild("Handle") end)
+                if h then run(function() h.CFrame=CFrame.new(Cam.CFrame.Position,tpos) end) end
+            end
+        end)
+
+        if G.CFG.humanize then
+            pcall(function()
+                local j=Vector3.new((math.random()-0.5)*G.CFG.jitter,(math.random()-0.5)*G.CFG.jitter,0)
+                Cam.CFrame=Cam.CFrame*CFrame.new(j)
+            end)
+        end
+    end)
+end
+
+-- ============================================================
+-- SECTION 6 — FIRE METHODS
+-- ============================================================
+local function fireVIM()
+    if not HAS.vim then return false end
+    return pcall(function()
+        local v=game:GetService("VirtualInputManager")
+        v:SendMouseButtonEvent(0,0,0,true, game,1)
+        task.wait(G.CFG.trigRelease)
+        v:SendMouseButtonEvent(0,0,0,false,game,1)
+    end)
+end
+local function fireRemote()
+    local r=getShootRemote(); if not r then return false end
+    local t=tcache.t
+    if t then
+        local tpos=t.pos or t.part.Position
+        local o=Cam.CFrame.Position
+        if pcall(function() r:FireServer({origin=o,direction=(tpos-o).Unit}) end) then return true end
+    end
+    return pcall(function() r:FireServer() end)
+end
+local function fireGC()
+    for _,h in ipairs(G.HOOKS.gc) do
+        local nm=h.name or ""
+        if nm:find("Fire",1,true) or nm:find("Shoot",1,true) or nm:find("Cast",1,true) then
+            if pcall(function() h.orig() end) then return true end
+        end
+    end
+    return false
+end
+local function doFire()
+    local m=G.CFG.trigMode
+    if m=="remote"     then if not fireRemote() then fireVIM() end
+    elseif m=="gc"     then if not fireGC()     then fireVIM() end
+    else fireVIM() end
+end
+
+-- ============================================================
+-- SECTION 7 — MOBILE BUTTON
+-- ============================================================
+G.TRIG_HELD=false
+local mobGui,mobBtn,mobConns=nil,nil,{}
+
+local function destroyMob()
+    for _,c in ipairs(mobConns) do pcall(function() c:Disconnect() end) end
+    mobConns={}
+    if mobGui then pcall(function() mobGui:Destroy() end) end
+    mobGui,mobBtn=nil,nil
+end
+
+local function applyMobStyle()
+    if not mobBtn then return end
+    local s=G.CFG.mobSize
+    run(function() mobBtn.Size=UDim2.new(0,s,0,s) end)
+    run(function() mobBtn.Position=UDim2.new(1,-s+G.CFG.mobX,1,-s-110+G.CFG.mobY) end)
+    run(function() mobBtn.Text=G.CFG.mobText end)
+    run(function() mobBtn.BackgroundColor3=Color3.fromRGB(G.CFG.mobR,G.CFG.mobG,G.CFG.mobB) end)
+    run(function() mobBtn.BackgroundTransparency=G.CFG.mobAlpha end)
+end
+
+local function buildMob()
+    if mobGui and mobGui.Parent then applyMobStyle(); return end
+    destroyMob()
+    local sg=Instance.new("ScreenGui")
+    sg.Name="NonoMob"; sg.ResetOnSpawn=false; sg.IgnoreGuiInset=true; sg.DisplayOrder=999
+    pcall(function() sg.Parent=game:GetService("CoreGui") end)
+    if not sg.Parent then pcall(function() sg.Parent=LP:WaitForChild("PlayerGui") end) end
+    if not sg.Parent then return end
+    local btn=Instance.new("TextButton")
+    btn.Name="Mob"; btn.BorderSizePixel=0; btn.TextColor3=Color3.new(1,1,1)
+    btn.TextSize=22; btn.Font=Enum.Font.GothamBold; btn.AutoButtonColor=false; btn.Visible=false
+    btn.Parent=sg
+    local co=Instance.new("UICorner"); co.CornerRadius=UDim.new(1,0); co.Parent=btn
+    mobConns[#mobConns+1]=btn.MouseButton1Down:Connect(function() G.TRIG_HELD=true  end)
+    mobConns[#mobConns+1]=btn.MouseButton1Up:Connect(  function() G.TRIG_HELD=false end)
+    mobConns[#mobConns+1]=btn.MouseLeave:Connect(       function() G.TRIG_HELD=false end)
+    local drag,dS,dP
+    mobConns[#mobConns+1]=btn.InputBegan:Connect(function(i)
+        if i.UserInputType==Enum.UserInputType.Touch then drag=true;dS=i.Position;dP=btn.Position end
+    end)
+    mobConns[#mobConns+1]=UIS.InputChanged:Connect(function(i)
+        if drag and i.UserInputType==Enum.UserInputType.Touch then
+            local d=i.Position-dS
+            btn.Position=UDim2.new(dP.X.Scale,dP.X.Offset+d.X,dP.Y.Scale,dP.Y.Offset+d.Y)
+        end
+    end)
+    mobConns[#mobConns+1]=UIS.InputEnded:Connect(function(i)
+        if i.UserInputType==Enum.UserInputType.Touch then drag=false end
+    end)
+    mobGui=sg; mobBtn=btn; applyMobStyle()
+end
+
+local function refreshMob()
+    if not G.CFG.mobEnabled then if mobBtn then run(function() mobBtn.Visible=false end) end; return end
+    buildMob()
+    if mobBtn then run(function() mobBtn.Visible=UIS.TouchEnabled and G.CFG.tbot end) end
+end
+
+local function keyHeld()
+    if G.TRIG_HELD then return true end
+    if not G.CFG.trigKey then return true end
+    local ok,k=pcall(function() return UIS:IsKeyDown(G.CFG.trigKeyCode) end)
+    return ok and k
+end
+
+-- ============================================================
+-- SECTION 8 — TRIGGERBOT
+-- ============================================================
+local tbotUp=false
+local function startTriggerbot()
+    if tbotUp then return end; tbotUp=true
+    task.spawn(function()
+        while true do
+            task.wait(0.04)
+            run(refreshMob)
+            if not G.CFG.tbot or not keyHeld() then continue end
+
+            local t=tcache.t
+            local fire=false
+
+            if t and t.part then
+                local sp,vis=Cam:WorldToViewportPoint(t.pos or t.part.Position)
+                if vis then
+                    local vp=Cam.ViewportSize
+                    if Vector2.new(sp.X-vp.X/2,sp.Y-vp.Y/2).Magnitude < math.max(60,G.CFG.fov*0.4) then
+                        fire=true
+                    end
+                end
+            end
+
+            if not fire then
+                byp(true)
+                local cf=safe(function() return Cam.CFrame end)
+                if cf then
+                    local ray=Ray.new(cf.Position,cf.LookVector*2000)
+                    local hit=safe(function() return workspace:FindPartOnRayWithIgnoreList(ray,{LPChar,Cam}) end)
+                    if hit then
+                        local model=safe(function() return hit:FindFirstAncestorWhichIsA("Model") end)
+                        if model then
+                            local hum=safe(function() return model:FindFirstChildWhichIsA("Humanoid") end)
+                            if hum and (safe(function() return hum.Health end) or 0)>0 then
+                                local ok2=true
+                                if G.CFG.teamCheck then
+                                    local pl=Players:GetPlayerFromCharacter(model)
+                                    if pl and safe(function() return pl.Team==LP.Team end) then ok2=false end
+                                end
+                                if ok2 then fire=true end
+                            end
+                        end
+                    end
+                end
+                byp(false)
+            end
+
+            if fire then task.wait(G.CFG.trigDelay); doFire() end
+        end
+    end)
+end
+
+-- ============================================================
+-- SECTION 9 — RAGEBOT
+-- ============================================================
+local rbotUp=false
+local function startRagebot()
+    if rbotUp then return end; rbotUp=true
+    task.spawn(function()
+        while true do
+            task.wait(G.CFG.rageInt)
+            if not G.CFG.ragebot or #G.SCAN.antiCheat>0 then continue end
+            local t=tcache.t; if not t then continue end
+            for i=1,G.CFG.multiShot do
+                if not fireRemote() then fireVIM() end
+                if i<G.CFG.multiShot then task.wait(0.016) end
+            end
+        end
+    end)
+end
+
+-- ============================================================
+-- SECTION 10 — ESP
+-- ============================================================
+local espC={}
+
+local function newDraw(kind,props)
+    if not HAS.Drawing then return nil end
+    local ok,dr=pcall(function() return Drawing.new(kind) end)
+    if not ok then return nil end
+    for k,v in pairs(props) do pcall(function() dr[k]=v end) end
+    return dr
+end
+
+local function makeESP(pl)
+    if espC[pl] then return end
+    local e={
+        box  = newDraw("Square",{Thickness=1,Color=Color3.fromRGB(255,50,50), Filled=false,Visible=false}),
+        hp   = newDraw("Square",{Filled=true, Color=Color3.new(0,1,0),         Visible=false}),
+        name = newDraw("Text",  {Size=13,Center=true,Outline=true,Color=Color3.new(1,1,1),Visible=false}),
+        dist = newDraw("Text",  {Size=11,Center=true,Outline=true,Color=Color3.fromRGB(255,220,50),Visible=false}),
+        snap = newDraw("Line",  {Thickness=1,Color=Color3.fromRGB(255,130,50),Visible=false}),
+    }
+    if e.box and e.hp and e.name and e.dist and e.snap then espC[pl]=e end
+end
+
+local function killESP(pl)
+    local e=espC[pl]; if not e then return end
+    for _,d in pairs(e) do pcall(function() d:Remove() end) end
+    espC[pl]=nil
+end
+
+local function hideESP(pl)
+    local e=espC[pl]; if not e then return end
+    for _,d in pairs(e) do pcall(function() d.Visible=false end) end
+end
+
+local function startESP()
+    if not HAS.Drawing then log("[ESP] no Drawing API"); return end
+    for _,pl in ipairs(Players:GetPlayers()) do if pl~=LP then makeESP(pl) end end
+    Players.PlayerAdded:Connect(function(pl) task.wait(1); if pl~=LP then makeESP(pl) end end)
+    Players.PlayerRemoving:Connect(killESP)
+
+    CONNS[#CONNS+1]=RunService.RenderStepped:Connect(function()
+        if not G.CFG.esp then
+            for pl in pairs(espC) do hideESP(pl) end; return
+        end
+        local lpHRP=LPChar and safe(function() return LPChar:FindFirstChild("HumanoidRootPart") end)
+        local vp=Cam.ViewportSize
+        local cx,cy=vp.X/2,vp.Y/2
+
+        for _,pl in ipairs(Players:GetPlayers()) do
+            if pl==LP then continue end
+            if not espC[pl] then makeESP(pl) end
+            local e=espC[pl]; if not e then continue end
+
+            local char =safe(function() return pl.Character end)
+            local hrp  =char and safe(function() return char:FindFirstChild("HumanoidRootPart") end)
+            local head =char and (safe(function() return char:FindFirstChild("Head") end)
+                              or  safe(function() return char:FindFirstChildWhichIsA("BasePart") end))
+            local hum  =char and safe(function() return char:FindFirstChildWhichIsA("Humanoid") end)
+
+            if not hrp or not head or not hum then hideESP(pl); continue end
+            if (safe(function() return hum.Health end) or 0)<=0 then hideESP(pl); continue end
+
+            local dist=lpHRP and (hrp.Position-lpHRP.Position).Magnitude or 9999
+            if dist>G.CFG.espDist then hideESP(pl); continue end
+
+            local headSP,vis=Cam:WorldToViewportPoint(head.Position+Vector3.new(0,0.6,0))
+            local botSP     =Cam:WorldToViewportPoint(hrp.Position -Vector3.new(0,3,0))
+
+            local isTarget = tcache.t and tcache.t.pl==pl
+
+            if not vis then
+                local sc=Vector2.new(cx,cy)
+                local dv=Vector2.new(headSP.X,headSP.Y)-sc
+                if dv.Magnitude>0 then
+                    local edge=sc+dv.Unit*(math.min(cx,cy)*0.85)
+                    pcall(function() e.snap.From=sc; e.snap.To=edge; e.snap.Visible=true end)
+                end
+                pcall(function() e.box.Visible=false; e.hp.Visible=false; e.name.Visible=false; e.dist.Visible=false end)
+                continue
+            end
+
+            pcall(function() e.snap.Visible=false end)
+
+            local bH=math.max(2,math.abs(headSP.Y-botSP.Y))
+            local bW=bH*0.55
+            local hp =math.max(0,safe(function() return hum.Health end) or 0)
+            local mhp=math.max(1,safe(function() return hum.MaxHealth end) or 100)
+            local hr =math.clamp(hp/mhp,0,1)
+
+            pcall(function()
+                e.box.Size    =Vector2.new(bW,bH)
+                e.box.Position=Vector2.new(headSP.X-bW/2,headSP.Y)
+                e.box.Color   =isTarget and Color3.fromRGB(255,255,0) or Color3.fromRGB(255,50,50)
+                e.box.Visible =true
+            end)
+            pcall(function()
+                e.hp.Color   =Color3.new(1-hr,hr,0)
+                e.hp.Size    =Vector2.new(4,bH*hr)
+                e.hp.Position=Vector2.new(headSP.X-bW/2-7,headSP.Y+bH*(1-hr))
+                e.hp.Visible =true
+            end)
+            pcall(function()
+                e.name.Text    =pl.DisplayName.."  ["..math.floor(hp).."]"
+                e.name.Position=Vector2.new(headSP.X,headSP.Y-16)
+                e.name.Visible =true
+            end)
+            pcall(function()
+                e.dist.Text    =("[%.0fm]"):format(dist)
+                e.dist.Position=Vector2.new(headSP.X,botSP.Y+3)
+                e.dist.Visible =true
+            end)
+        end
+    end)
+end
+
+-- ============================================================
+-- SECTION 11 — FOV CIRCLE
+-- ============================================================
+local fovC
+if HAS.Drawing then
+    pcall(function()
+        fovC=Drawing.new("Circle")
+        fovC.NumSides=64; fovC.Thickness=1
+        fovC.Color=Color3.new(1,1,1); fovC.Filled=false; fovC.Visible=false
+        DRAWS[#DRAWS+1]=fovC
+    end)
+end
+CONNS[#CONNS+1]=RunService.RenderStepped:Connect(function()
+    if not fovC then return end
+    local vp=Cam.ViewportSize
+    pcall(function()
+        fovC.Visible =G.CFG.silentAim or G.CFG.aimbot
+        fovC.Radius  =G.CFG.fov
+        fovC.Position=Vector2.new(vp.X/2,vp.Y/2)
+    end)
+end)
+
+-- ============================================================
+-- HEARTBEAT
+-- ============================================================
+CONNS[#CONNS+1]=RunService.Heartbeat:Connect(function(dt)
+    if dt<=0 then return end
+    fpsBuf[#fpsBuf+1]=1/dt
+    if #fpsBuf>30 then table.remove(fpsBuf,1) end
+    local s=0; for _,f in ipairs(fpsBuf) do s+=f end
+    G.STATS.fps =math.floor(s/#fpsBuf)
+    G.STATS.ping=math.floor((safe(function() return LP:GetNetworkPing() end) or 0)*1000)
+    local n=0
+    for _,k in ipairs({"silentAim","aimbot","tbot","ragebot","esp"}) do if G.CFG[k] then n+=1 end end
+    G.STATS.active=n
+    pcall(refreshCache)
+end)
+
+-- ============================================================
+-- SAVE / LOAD
+-- ============================================================
+local function saveConfig()
+    if not HAS.writefile then return end
+    pcall(function() writefile("nono_v10.json",Http:JSONEncode(G.CFG)) end)
+end
+local function loadConfig()
+    if not HAS.readfile then return end
+    pcall(function()
+        if HAS.isfile and not isfile("nono_v10.json") then return end
+        local raw=readfile("nono_v10.json")
+        if raw and #raw>2 then
+            local d=Http:JSONDecode(raw)
+            for k,v in pairs(d) do if G.CFG[k]~=nil then G.CFG[k]=v end end
+        end
+    end)
+end
+loadConfig()
+task.spawn(function() while task.wait(30) do saveConfig() end end)
+
+-- ============================================================
+-- UNLOAD
+-- ============================================================
+_G.NONO_UNLOAD=function()
+    G.ENABLED=false
+    for _,c in ipairs(CONNS) do pcall(function() c:Disconnect() end) end
+    for pl in pairs(espC) do killESP(pl) end
+    for _,d in ipairs(DRAWS) do pcall(function() d:Remove() end) end
+    if fovC then pcall(function() fovC:Remove() end) end
+    uninstallGC(); destroyMob(); saveConfig()
+    print("[Nono] v10 unloaded")
+end
+
+-- ============================================================
+-- UI — OBSIDIAN
+-- ============================================================
+local Library,Window
+local UI={}
+
+local function sl(lbl,txt)
+    if not lbl then return end
+    local s=tostring(txt)
+    pcall(function() lbl.Text=s end)
+    pcall(function() lbl:SetText(s) end)
+    pcall(function() if lbl.Label     then lbl.Label.Text=s     end end)
+    pcall(function() if lbl.Object    then lbl.Object.Text=s    end end)
+    pcall(function() if lbl.Instance  then lbl.Instance.Text=s  end end)
+    pcall(function() if lbl.TextLabel then lbl.TextLabel.Text=s end end)
+end
+
+local function refreshAllDropdowns()
+    pcall(function() if UI.hitPartDrop then UI.hitPartDrop:SetValues(G.SCAN.parts)     end end)
+    pcall(function() if UI.shootDrop   then UI.shootDrop:SetValues(G.SCAN.shootList)   end end)
+    pcall(function() if UI.vmDrop      then UI.vmDrop:SetValues(G.SCAN.vmList)         end end)
+end
+
+local function buildUI()
+    print("[Nono] Loading Obsidian…")
+    local ok,lib=pcall(function()
+        return loadstring(game:HttpGet(
+            "https://raw.githubusercontent.com/deividcomsono/Obsidian/main/Library.lua"
+        ))()
+    end)
+    if not ok or type(lib)~="table" then warn("[Nono] Obsidian fail: "..tostring(lib)); return end
+    Library=lib
+
+    local okW,win=pcall(function()
+        return Library:CreateWindow({
+            Title="nono v10  ·  "..G.SCAN.class,
+            Footer="made by nono",
+            AutoShow=true, Center=true, NotifySide="Right",
+        })
+    end)
+    if not okW then warn("[Nono] Window: "..tostring(win)); return end
+    Window=win
+
+    local function tab(nm)
+        local ok2,t=pcall(function() return Window:AddTab(nm) end)
+        return ok2 and t or nil
+    end
+
+    -- ==================================================
+    -- MAIN
+    -- ==================================================
+    local TM=tab("Main"); if not TM then return end
+
+    local SB=TM:AddLeftGroupbox("Status")
+    UI.lblStatus=SB:AddLabel("…")
+    UI.lblScan  =SB:AddLabel("Scan: 0%")
+    UI.lblGC    =SB:AddLabel("GC: —")
+    UI.lblAC    =SB:AddLabel("AC: …")
+    UI.lblClass =SB:AddLabel("Class: …")
+    UI.lblMove  =SB:AddLabel("Move: …")
+    UI.lblArms  =SB:AddLabel("Arms: …")
+    UI.lblParts =SB:AddLabel("Parts: 0")
+    UI.lblVMs   =SB:AddLabel("VMs: 0")
+    UI.lblRems  =SB:AddLabel("Remotes: 0")
+
+    task.spawn(function()
+        while task.wait(0.3) do pcall(function()
+            sl(UI.lblStatus,("FPS %d  Ping %dms  Active %d"):format(G.STATS.fps,G.STATS.ping,G.STATS.active))
+            sl(UI.lblScan,  ("Scan %d%%  GC %d%%"):format(
+                math.floor(G.SCAN_STAGE/math.max(1,G.SCAN_TOTAL)*100),
+                math.floor(G.GC_STAGE /math.max(1,G.GC_TOTAL)*100)))
+            sl(UI.lblGC,    ("GC:%d hooks  Meta:%s"):format(#G.HOOKS.gc, G.HOOKS.meta and G.HOOKS.meta.via or "off"))
+            sl(UI.lblAC,    #G.SCAN.antiCheat>0 and ("⚠ AC x%d"):format(#G.SCAN.antiCheat) or "AC: clean")
+            sl(UI.lblClass, "Class: "..G.SCAN.class)
+            sl(UI.lblMove,  "Move: "..G.SCAN.moveSystem)
+            sl(UI.lblArms,  "Arms: "..table.concat(G.SCAN.armNames," | "))
+            sl(UI.lblParts, ("Parts: %d"):format(#G.SCAN.parts))
+            sl(UI.lblVMs,   ("VMs: %d"):format(#G.SCAN.vmList-1))
+            sl(UI.lblRems,  ("Remotes: %d  Shoot: %d"):format(#G.SCAN.remotes,#G.SCAN.shootList-1))
+        end) end
+    end)
+
+    -- Combat
+    local CB=TM:AddLeftGroupbox("Combat")
+    CB:AddToggle("silentAim",{Text="Silent Aim",Default=G.CFG.silentAim,
+        Callback=function(v) G.CFG.silentAim=v; if v then installHooks() end end})
+    CB:AddSlider("fov",{Text="FOV",Default=G.CFG.fov,Min=5,Max=2000,Rounding=0,
+        Callback=function(v) G.CFG.fov=v end})
+    UI.hitPartDrop=CB:AddDropdown("hitPart",{
+        Text="Hit Part",Values=G.SCAN.parts,Default=G.CFG.hitPart,
+        Callback=function(v) G.CFG.hitPart=v end})
+    CB:AddToggle("wallCheck",{Text="Wall Check",Default=G.CFG.wallCheck,
+        Callback=function(v) G.CFG.wallCheck=v end})
+    CB:AddToggle("teamCheck",{Text="Team Check",Default=G.CFG.teamCheck,
+        Callback=function(v) G.CFG.teamCheck=v end})
+    CB:AddSlider("hitChance",{Text="Hit Chance %",Default=G.CFG.hitChance,Min=0,Max=100,Rounding=0,
+        Callback=function(v) G.CFG.hitChance=v end})
+    CB:AddToggle("predict",{Text="Prediction",Default=G.CFG.predict,
+        Callback=function(v) G.CFG.predict=v end})
+    CB:AddSlider("predictStr",{Text="Predict Str x10",Default=math.floor(G.CFG.predictStr*10),Min=5,Max=30,Rounding=0,
+        Callback=function(v) G.CFG.predictStr=v/10 end})
+
+    -- Aimbot
+    local AB=TM:AddRightGroupbox("Aimbot")
+    AB:AddToggle("aimbot",{Text="Aimbot",Default=G.CFG.aimbot,
+        Callback=function(v) G.CFG.aimbot=v end})
+    AB:AddSlider("smooth",{Text="Smoothness",Default=G.CFG.smooth,Min=1,Max=25,Rounding=0,
+        Callback=function(v) G.CFG.smooth=v end})
+    AB:AddDropdown("aimbotMode",{Text="Mode",
+        Values={"camera","humanoid_targetpoint","viewmodel"},Default=G.CFG.aimbotMode,
+        Callback=function(v) G.CFG.aimbotMode=v end})
+    AB:AddToggle("humanize",{Text="Humanize",Default=G.CFG.humanize,
+        Callback=function(v) G.CFG.humanize=v end})
+    AB:AddSlider("jitter",{Text="Jitter",Default=G.CFG.jitter,Min=0,Max=20,Rounding=0,
+        Callback=function(v) G.CFG.jitter=v end})
+
+    -- Triggerbot
+    local TB=TM:AddRightGroupbox("Triggerbot")
+    TB:AddToggle("tbot",{Text="Triggerbot",Default=G.CFG.tbot,
+        Callback=function(v) G.CFG.tbot=v; if v then startTriggerbot() end; refreshMob() end})
+    TB:AddSlider("trigDelay",{Text="Delay ms",Default=math.floor(G.CFG.trigDelay*1000),Min=0,Max=500,Rounding=0,
+        Callback=function(v) G.CFG.trigDelay=v/1000 end})
+    TB:AddSlider("trigRelease",{Text="Release ms",Default=math.floor(G.CFG.trigRelease*1000),Min=0,Max=500,Rounding=0,
+        Callback=function(v) G.CFG.trigRelease=v/1000 end})
+    TB:AddDropdown("trigMode",{Text="Fire",Values={"vim","remote","gc"},Default=G.CFG.trigMode,
+        Callback=function(v) G.CFG.trigMode=v end})
+    TB:AddToggle("trigKey",{Text="Require key",Default=G.CFG.trigKey,
+        Callback=function(v) G.CFG.trigKey=v end})
+
+    -- Ragebot
+    local RB=TM:AddRightGroupbox("Ragebot")
+    RB:AddToggle("ragebot",{Text="Ragebot",Default=G.CFG.ragebot,
+        Callback=function(v) G.CFG.ragebot=v; if v then startRagebot() end end})
+    RB:AddSlider("rageInt",{Text="Interval x100",Default=math.floor(G.CFG.rageInt*100),Min=1,Max=100,Rounding=0,
+        Callback=function(v) G.CFG.rageInt=v/100 end})
+    RB:AddSlider("multiShot",{Text="Multi-Shot",Default=G.CFG.multiShot,Min=1,Max=8,Rounding=0,
+        Callback=function(v) G.CFG.multiShot=v end})
+
+    -- Presets
+    local PB=TM:AddRightGroupbox("Presets")
+    for _,name in ipairs({"Rage","Legit","Stealth"}) do
+        PB:AddButton({Text=name,Func=function()
+            for k,v in pairs(PRESETS[name]) do G.CFG[k]=v end
+            pcall(function() Library:Notify({Title="Preset",Description=name,Duration=2}) end)
+        end})
+    end
+
+    -- ==================================================
+    -- SCANNER TAB
+    -- ==================================================
+    local TS=tab("Scanner")
+    if TS then
+        local SCB=TS:AddLeftGroupbox("Controls")
+
+        SCB:AddButton({Text="▶ Full Scan",Func=function()
+            G.REPORT={}; G.SCAN_STAGE=0
+            runScanner(function()
+                refreshAllDropdowns()
+                if G.REFRESH_REPORT then G.REFRESH_REPORT() end
+                if G.REFRESH_EXPLORER then G.REFRESH_EXPLORER() end
+                pcall(function()
+                    Library:Notify({
+                        Title="Scan Done",
+                        Description=("Class:%s Parts:%d VMs:%d Remotes:%d AC:%d"):format(
+                            G.SCAN.class,#G.SCAN.parts,#G.SCAN.vmList-1,
+                            #G.SCAN.remotes,#G.SCAN.antiCheat),
+                        Duration=5,
+                    })
+                end)
+            end)
+        end})
+
+        SCB:AddButton({Text="⚡ GC Hook",Func=function()
+            task.spawn(function()
+                uninstallGC(); G.HOOKS.gcDone=false
+                pcall(installGCHook)
+                pcall(function()
+                    Library:Notify({Title="GC",Description=("Hooked %d"):format(#G.HOOKS.gc),Duration=3})
+                end)
+            end)
+        end})
+
+        SCB:AddButton({Text="🔄 Re-Hook",Func=function()
+            forceReinstall()
+            pcall(function() Library:Notify({Title="Re-Hook",Description="Done",Duration=2}) end)
+        end})
+
+        SCB:AddButton({Text="📋 Copy Report",Func=function()
+            if HAS.setclip then pcall(function() setclipboard(table.concat(G.REPORT,"\n")) end) end
+            pcall(function() Library:Notify({Title="Copied",Duration=2}) end)
+        end})
+
+        -- shoot remote picker
+        local SRB=TS:AddRightGroupbox("Shoot Remote")
+        UI.shootDrop=SRB:AddDropdown("shootRemote",{
+            Text="Remote",Values=G.SCAN.shootList,Default=G.CFG.shootRemote,
+            Callback=function(v)
+                G.CFG.shootRemote=v
+                G.SCAN.activeShoot=nil
+                if v~="auto" then
+                    for _,r in ipairs(G.SCAN.remotes) do
+                        if r.name==v then G.SCAN.activeShoot=r.obj; break end
+                    end
+                else
+                    for _,r in ipairs(G.SCAN.remotes) do
+                        if r.purpose=="shoot" or r.purpose=="dmg" then
+                            G.SCAN.activeShoot=r.obj; break
+                        end
+                    end
+                end
+            end})
+
+        -- viewmodel picker
+        local VMB=TS:AddRightGroupbox("Viewmodel")
+        UI.vmDrop=VMB:AddDropdown("vm",{
+            Text="Active VM",Values=G.SCAN.vmList,Default="none",
+            Callback=function(v)
+                G.SCAN.activeVM=G.SCAN.vmObjects[v] or nil
+            end})
+
+        -- ── Explorer view (shows rig report) ──
+        local EXB=TS:AddLeftGroupbox("Explorer")
+        local explorerLbl=EXB:AddLabel("Run Full Scan to populate")
+        G.REFRESH_EXPLORER=function()
+            local lines=G.SCAN.explorerLines
+            local txt=#lines>0 and table.concat(lines,"\n") or "(no rigs found)"
+            pcall(function() sl(explorerLbl,txt) end)
+        end
+
+        -- ── Scan log ──
+        local logLbl=SCB:AddLabel("(run Full Scan)")
+        G.REFRESH_REPORT=function()
+            local txt=table.concat(G.REPORT,"\n")
+            pcall(function() sl(logLbl,txt) end)
+        end
+    end
+
+    -- ==================================================
+    -- MOBILE
+    -- ==================================================
+    local TMob=tab("Mobile")
+    if TMob then
+        local MB=TMob:AddLeftGroupbox("Fire Button")
+        MB:AddToggle("mobEnabled",{Text="Enabled",Default=G.CFG.mobEnabled,
+            Callback=function(v) G.CFG.mobEnabled=v; refreshMob() end})
+        MB:AddSlider("mobSize",{Text="Size",Default=G.CFG.mobSize,Min=50,Max=300,Rounding=0,
+            Callback=function(v) G.CFG.mobSize=v; applyMobStyle() end})
+        MB:AddSlider("mobX",{Text="X",Default=G.CFG.mobX,Min=-600,Max=600,Rounding=0,
+            Callback=function(v) G.CFG.mobX=v; applyMobStyle() end})
+        MB:AddSlider("mobY",{Text="Y",Default=G.CFG.mobY,Min=-800,Max=800,Rounding=0,
+            Callback=function(v) G.CFG.mobY=v; applyMobStyle() end})
+        MB:AddSlider("mobAlpha",{Text="Transparency",Default=math.floor(G.CFG.mobAlpha*100),Min=0,Max=90,Rounding=0,
+            Callback=function(v) G.CFG.mobAlpha=v/100; applyMobStyle() end})
+        pcall(function()
+            MB:AddInput("mobText",{Text="Label",Default=G.CFG.mobText,
+                Callback=function(v) G.CFG.mobText=v; applyMobStyle() end})
+        end)
+        local CB2=TMob:AddRightGroupbox("Color RGB")
+        CB2:AddSlider("mobR",{Text="R",Default=G.CFG.mobR,Min=0,Max=255,Rounding=0,Callback=function(v) G.CFG.mobR=v; applyMobStyle() end})
+        CB2:AddSlider("mobG",{Text="G",Default=G.CFG.mobG,Min=0,Max=255,Rounding=0,Callback=function(v) G.CFG.mobG=v; applyMobStyle() end})
+        CB2:AddSlider("mobB",{Text="B",Default=G.CFG.mobB,Min=0,Max=255,Rounding=0,Callback=function(v) G.CFG.mobB=v; applyMobStyle() end})
+        CB2:AddButton({Text="Reset Pos",Func=function() G.CFG.mobX=0; G.CFG.mobY=0; applyMobStyle() end})
+    end
+
+    -- ==================================================
+    -- VISUALS
+    -- ==================================================
+    local TV=tab("Visuals")
+    if TV then
+        local EB=TV:AddLeftGroupbox("ESP")
+        EB:AddToggle("esp",{Text="ESP",Default=G.CFG.esp,Callback=function(v) G.CFG.esp=v end})
+        EB:AddSlider("espDist",{Text="Distance",Default=G.CFG.espDist,Min=50,Max=3000,Rounding=0,
+            Callback=function(v) G.CFG.espDist=v end})
+        local IB=TV:AddRightGroupbox("Caps")
+        IB:AddLabel(HAS.Drawing  and "Drawing: OK"    or "Drawing: MISSING")
+        IB:AddLabel(HAS.vim      and "VIM: OK"         or "VIM: MISSING")
+        IB:AddLabel(HAS.hookmeta and "hookmetamethod: OK" or "hookmetamethod: MISSING")
+        IB:AddLabel(HAS.hookfn   and "hookfunction: OK"   or "hookfunction: MISSING")
+        IB:AddLabel(HAS.getgc    and "getgc: OK"          or "getgc: MISSING")
+        IB:AddLabel(HAS.getnils  and "getnilinstances: OK" or "getnilinstances: MISSING")
+    end
+
+    -- ==================================================
+    -- SETTINGS
+    -- ==================================================
+    local TSet=tab("Settings")
+    if TSet then
+        local SB2=TSet:AddLeftGroupbox("Script")
+        SB2:AddButton({Text="Save Config",Func=function()
+            saveConfig()
+            pcall(function() Library:Notify({Title="Saved",Description="nono_v10.json",Duration=2}) end)
+        end})
+        SB2:AddButton({Text="Unload",Func=function()
+            _G.NONO_UNLOAD()
+            pcall(function() Library:Destroy() end)
+        end})
+    end
+
+    print("[Nono] ✓ UI v10 ready")
+end
+
+-- ============================================================
+-- BOOT
+-- ============================================================
+task.spawn(function()
+    print("[Nono] v10 boot")
+    startAimbot()
+    startESP()
+    startTriggerbot()
+    startRagebot()
+
+    local ok,err=pcall(buildUI)
+    if not ok then warn("[Nono] UI err: "..tostring(err)) end
+
+    runScanner(function()
+        print(("[Nono] scan done — %s | parts:%d | vms:%d | remotes:%d | ac:%d"):format(
+            G.SCAN.class,#G.SCAN.parts,#G.SCAN.vmList-1,#G.SCAN.remotes,#G.SCAN.antiCheat))
+        refreshAllDropdowns()
+        if G.REFRESH_REPORT   then G.REFRESH_REPORT()   end
+        if G.REFRESH_EXPLORER then G.REFRESH_EXPLORER() end
+    end)
+
+    print("[Nono] v10 ready")
+end)
